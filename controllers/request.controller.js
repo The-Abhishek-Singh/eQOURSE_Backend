@@ -1,4 +1,4 @@
-import { Request } from "../models/request.model.js";
+import { Request } from "../models/Request.model.js";
 import { classifySupportMessage } from "../services/ai.service.js";
 import Groq from "groq-sdk";
 
