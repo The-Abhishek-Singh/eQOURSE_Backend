@@ -1,4 +1,4 @@
-import { Request } from "../models/request.model.js";
+import { Request } from "../models/Request.model.js";
 import { classifySupportMessage } from "../services/ai.service.js";
 import Groq from "groq-sdk";
 
@@ -8,34 +8,56 @@ const PRIORITY_WEIGHT = {
   High: 3,
 };
 
-// Bag-of-words token similarity check (handles word order like "network issue" vs "issue in network")
-function tokenSimilarity(str1, str2) {
-  const clean = (s) =>
-    s
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, "")
-      .split(/\s+/)
-      .filter(Boolean);
-
-  const tokens1 = new Set(clean(str1));
-  const tokens2 = new Set(clean(str2));
-
-  const intersection = [...tokens1].filter((x) => tokens2.has(x));
-  const union = new Set([...tokens1, ...tokens2]);
-
-  if (union.size === 0) return 0;
-  return intersection.length / union.size;
+// Clean and tokenize text into distinct normalized words
+function tokenize(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-// Semantic checker (Local token overlap + LLM verification)
+// Multi-tier local semantic & phrase similarity check
+function isMeaningfullySameLocal(str1, str2) {
+  const norm1 = str1
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]/g, "");
+  const norm2 = str2
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]/g, "");
+
+  // 1. Direct normalization match
+  if (norm1 === norm2) return true;
+
+  const t1 = tokenize(str1);
+  const t2 = tokenize(str2);
+
+  if (t1.length === 0 || t2.length === 0) return false;
+
+  const set1 = new Set(t1);
+  const set2 = new Set(t2);
+
+  const intersection = [...set1].filter((x) => set2.has(x));
+  const union = new Set([...set1, ...set2]);
+
+  const jaccard = intersection.length / union.size;
+  const minOverlap = intersection.length / Math.min(set1.size, set2.size);
+
+  // 2. High Jaccard similarity OR full subset overlap
+  // (e.g., "Payment fail" is 100% inside "payment is getting fail")
+  return jaccard >= 0.4 || minOverlap >= 0.75;
+}
+
+// Full deduplication checker (Local fast-path + LLM verification)
 async function isMeaningfullySame(msg1, msg2) {
-  // 1. Direct match or same words in different order ("network issue" === "issue in network")
-  const similarity = tokenSimilarity(msg1, msg2);
-  if (similarity >= 0.7) {
+  // Step 1: Fast local algorithmic check
+  if (isMeaningfullySameLocal(msg1, msg2)) {
     return true;
   }
 
-  // 2. Fallback to Groq LLM check
+  // Step 2: Fallback to LLM semantic comparison
   try {
     const apiKey = process.env.GROQ_API_KEY;
     if (!apiKey) return false;
@@ -47,7 +69,7 @@ async function isMeaningfullySame(msg1, msg2) {
         {
           role: "system",
           content:
-            'You are a ticket deduplication system. Respond with ONLY the word "YES" if the two messages represent the exact same support issue, or "NO" if they are different.',
+            'You are a support ticket deduplication system. Respond with ONLY "YES" if both messages describe the exact same underlying issue or intention, or "NO" if they describe different issues.',
         },
         {
           role: "user",
@@ -59,9 +81,9 @@ async function isMeaningfullySame(msg1, msg2) {
     });
 
     const answer = res.choices[0]?.message?.content?.trim().toUpperCase();
-    return answer.includes("YES");
+    return Boolean(answer && answer.includes("YES"));
   } catch (err) {
-    console.error("Deduplication error:", err.message);
+    console.error("Deduplication AI error:", err.message);
     return false;
   }
 }
@@ -88,7 +110,7 @@ export const createRequest = async (req, res) => {
     const normalizedMessage = message.trim();
     const sixtySecondsAgo = new Date(Date.now() - 60 * 1000);
 
-    // Fetch the most recent tickets for this email
+    // Fetch the recent tickets for this email within the last 60 seconds
     const recentRequests = await Request.find({
       email: normalizedEmail,
       createdAt: { $gte: sixtySecondsAgo },
@@ -96,7 +118,7 @@ export const createRequest = async (req, res) => {
 
     let existingRequest = null;
 
-    // Check if any recent ticket matches within the 60s window
+    // Check if any recent ticket is "meaningfully the same"
     for (const reqItem of recentRequests) {
       const isDuplicate = await isMeaningfullySame(
         reqItem.message,
@@ -108,7 +130,7 @@ export const createRequest = async (req, res) => {
       }
     }
 
-    // Duplicate Handling
+    // Duplicate Handling & Priority Escalation
     if (existingRequest) {
       const incomingWeight = PRIORITY_WEIGHT[priority];
       const existingWeight = PRIORITY_WEIGHT[existingRequest.priority];
@@ -134,7 +156,7 @@ export const createRequest = async (req, res) => {
       });
     }
 
-    // AI Classification (Receives only message)
+    // AI Classification (Privacy-first: strictly message string only)
     const { category, classificationSource } =
       await classifySupportMessage(normalizedMessage);
 
